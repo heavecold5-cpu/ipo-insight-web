@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: ipo-insight-auto
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT
+    autoDeploy: true
