@@ -1,22 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-공모주 인사이트 자동수집 웹 - PUBLIC SOURCES FINAL
+공모주 인사이트 모바일 최종본
 
 목표:
-  - DART/KRX API 인증키 없이 공개 웹페이지를 읽어 공모주 일정을 자동 수집
-  - 1순위 DART 청약달력 웹페이지
-  - 2순위 KRX KIND 공모일정 웹페이지
-  - 3순위 38커뮤니케이션 / IPO38 보조 수집
-  - public/Profile 폴더가 없어도 server.py 단일 파일만으로 첫 화면 제공
-  - Render 배포 시 Not Found 방지
+- 모바일 전용 카드형 공모주 일정 웹
+- DART/KRX API 키 없이 공개 웹페이지 우선 수집
+- DART 청약달력 → KRX KIND → 38커뮤니케이션 → IPO38 순서로 시도
+- 한 소스가 실패해도 서버가 죽지 않도록 처리
+- Render 502 방지를 위해 외부 요청 timeout을 짧게 설정
+- public/Profile 폴더 없이 server.py 단일 파일로 첫 화면 제공
 
 Render Start Command:
-  gunicorn server:app --bind 0.0.0.0:$PORT
+gunicorn server:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+
+Render Build Command:
+pip install -r requirements.txt
 
 로컬 실행:
-  pip install -r requirements.txt
-  python server.py
-  http://127.0.0.1:5077 접속
+pip install -r requirements.txt
+python server.py
+http://127.0.0.1:5077
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,7 +40,6 @@ from flask import Flask, Response, jsonify, request
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 CACHE_FILE = DATA_DIR / "ipo_cache.json"
-
 DATA_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
@@ -58,24 +60,28 @@ SOURCES = [
         "url": "https://dart.fss.or.kr/dsac008/main.do",
         "base": "https://dart.fss.or.kr",
         "type": "dart_calendar",
+        "timeout": 5,
     },
     {
         "name": "KRX KIND 공모일정",
         "url": "https://kind.krx.co.kr/listinvstg/pubofrschdl.do?method=searchPubofrScholMain",
         "base": "https://kind.krx.co.kr",
         "type": "generic_table",
+        "timeout": 5,
     },
     {
         "name": "38커뮤니케이션",
         "url": "https://www.38.co.kr/html/fund/?o=k",
         "base": "https://www.38.co.kr",
         "type": "generic_table",
+        "timeout": 4,
     },
     {
         "name": "IPO38",
         "url": "https://www.ipo38.co.kr/ipo/?key=6",
         "base": "https://www.ipo38.co.kr",
         "type": "generic_table",
+        "timeout": 4,
     },
 ]
 
@@ -121,7 +127,6 @@ def parse_korean_number(text: str) -> Optional[float]:
         .replace("%", "")
         .strip()
     )
-
     match = re.search(r"(\d+(?:\.\d+)?)", cleaned)
 
     if not match:
@@ -169,8 +174,12 @@ def normalize_date_range(text: str, default_year: int) -> Optional[Tuple[str, st
     return None
 
 
-def fetch_html(url: str) -> str:
-    response = requests.get(url, headers=HEADERS, timeout=18)
+def fetch_html(source: Dict[str, Any]) -> str:
+    response = requests.get(
+        source["url"],
+        headers=HEADERS,
+        timeout=int(source.get("timeout", 5)),
+    )
     response.raise_for_status()
 
     apparent_encoding = response.apparent_encoding or ""
@@ -186,22 +195,16 @@ def fetch_html(url: str) -> str:
 def infer_sector(name: str) -> str:
     if "스팩" in name or "기업인수목적" in name:
         return "SPAC"
-
     if any(keyword in name for keyword in ["바이오", "헬스", "제약", "메디", "셀", "로직스", "이뮨"]):
         return "바이오 / 헬스케어"
-
     if any(keyword in name for keyword in ["로보", "비젼", "비전", "AI", "에이아이", "테크", "소프트", "락스"]):
         return "AI / 로봇 / 소프트웨어"
-
     if any(keyword in name for keyword in ["에너지", "배터리", "전지", "소재", "그린", "SKC"]):
         return "에너지 / 소재"
-
     if any(keyword in name for keyword in ["스튜디오", "콘텐츠", "엔터"]):
         return "콘텐츠 / 엔터테인먼트"
-
     if any(keyword in name for keyword in ["푸드", "식품", "피스피스"]):
         return "식품 / 소비재"
-
     return "확인 필요"
 
 
@@ -210,10 +213,8 @@ def infer_market(name: str, row_text: str = "") -> str:
 
     if "스팩" in text or "기업인수목적" in text:
         return "SPAC"
-
     if "유가증권" in text or "코스피" in text:
         return "KOSPI"
-
     if "코스닥" in text or re.search(r"(^|\s)코\s", text):
         return "KOSDAQ"
 
@@ -224,7 +225,6 @@ def calc_score(final_price: str, price_band: str, competition_rate: str, sector:
     score = 50
 
     competition = parse_korean_number(competition_rate)
-
     if competition is not None:
         if competition >= 2500:
             score += 28
@@ -306,7 +306,7 @@ def make_analysis(item: IPOItem) -> IPOItem:
     return item
 
 
-def parse_dart_calendar(html: str, source: Dict[str, str], default_year: int) -> List[IPOItem]:
+def parse_dart_calendar(html: str, source: Dict[str, Any], default_year: int) -> List[IPOItem]:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
     lines = [normalize_space(line) for line in text.splitlines() if normalize_space(line)]
@@ -403,7 +403,7 @@ def parse_dart_calendar(html: str, source: Dict[str, str], default_year: int) ->
     return sorted(items, key=lambda item: (item.subscriptionStart, item.name))
 
 
-def parse_generic_table(html: str, source: Dict[str, str], default_year: int) -> List[IPOItem]:
+def parse_generic_table(html: str, source: Dict[str, Any], default_year: int) -> List[IPOItem]:
     soup = BeautifulSoup(html, "html.parser")
     items: List[IPOItem] = []
 
@@ -532,7 +532,7 @@ def collect_ipos(force: bool = False, year: Optional[int] = None) -> Dict[str, A
 
     for source in SOURCES:
         try:
-            html = fetch_html(source["url"])
+            html = fetch_html(source)
 
             if source["type"] == "dart_calendar":
                 parsed = parse_dart_calendar(html, source, year)
@@ -569,21 +569,21 @@ HTML_PAGE = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>공모주 인사이트 자동수집</title>
+  <title>공모주 인사이트 모바일</title>
   <style>
     :root {
-      --ink: #0f172a;
-      --muted: #64748b;
-      --line: #e2e8f0;
-      --soft: #f1f5f9;
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --ink: #111827;
+      --muted: #6b7280;
+      --line: #e5e7eb;
       --dark: #020617;
+      --blue: #2563eb;
       --green: #047857;
       --amber: #b45309;
       --red: #b91c1c;
       --yellow: #fee500;
-      --blue: #2563eb;
-      --shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
-      --radius: 26px;
+      --shadow: 0 12px 28px rgba(15, 23, 42, .08);
     }
 
     * {
@@ -592,9 +592,9 @@ HTML_PAGE = r"""<!doctype html>
 
     body {
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+      background: var(--bg);
       color: var(--ink);
-      background: linear-gradient(180deg, #f8fafc 0%, #ffffff 45%, #eef2f7 100%);
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", sans-serif;
     }
 
     button,
@@ -604,280 +604,131 @@ HTML_PAGE = r"""<!doctype html>
       font-family: inherit;
     }
 
-    .wrap {
-      max-width: 1400px;
+    .app {
+      max-width: 520px;
       margin: 0 auto;
-      padding: 24px 16px 32px;
-    }
-
-    .hero {
-      background: radial-gradient(circle at top right, rgba(96, 165, 250, .35), transparent 30%),
-                  radial-gradient(circle at bottom left, rgba(45, 212, 191, .22), transparent 34%),
-                  var(--dark);
-      color: white;
-      border-radius: 34px;
-      padding: 42px;
-      box-shadow: var(--shadow);
-    }
-
-    .hero-grid {
-      display: grid;
-      grid-template-columns: 1fr 350px;
-      gap: 28px;
-      align-items: end;
-    }
-
-    .badge {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      background: rgba(255, 255, 255, .1);
-      border: 1px solid rgba(255, 255, 255, .12);
-      padding: 9px 14px;
-      border-radius: 999px;
-      color: #dbeafe;
-      font-size: 14px;
-      font-weight: 800;
-      margin-bottom: 18px;
-    }
-
-    h1 {
-      margin: 0;
-      max-width: 980px;
-      font-size: clamp(34px, 5vw, 64px);
-      letter-spacing: -.055em;
-      line-height: 1.02;
-    }
-
-    .hero p {
-      max-width: 850px;
-      color: #cbd5e1;
-      font-size: 18px;
-      line-height: 1.75;
-      margin: 18px 0 0;
-    }
-
-    .statbox {
-      display: grid;
-      gap: 12px;
-    }
-
-    .stat {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      background: rgba(255, 255, 255, .1);
-      border: 1px solid rgba(255, 255, 255, .1);
-      border-radius: 19px;
-      padding: 16px;
-    }
-
-    .stat span {
-      color: #cbd5e1;
-      font-size: 14px;
-    }
-
-    .stat strong {
-      font-size: 20px;
-    }
-
-    .filters,
-    .month-area,
-    .detail,
-    .ipo-card,
-    .share-panel,
-    .source-panel {
-      background: rgba(255, 255, 255, .92);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-    }
-
-    .source-panel,
-    .month-area,
-    .share-panel {
-      margin-top: 22px;
-      padding: 22px;
-    }
-
-    .source-panel h2,
-    .month-area h2,
-    .share-panel h2 {
-      margin: 0 0 16px;
-      font-size: 20px;
-    }
-
-    .notice {
-      background: #ecfeff;
-      border: 1px solid #a5f3fc;
-      color: #155e75;
-      border-radius: 18px;
-      padding: 14px 16px;
-      line-height: 1.65;
-      font-size: 14px;
-      font-weight: 800;
-    }
-
-    .source-status {
-      margin-top: 12px;
+      min-height: 100vh;
+      padding-bottom: 84px;
       background: #f8fafc;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 14px;
+    }
+
+    .top {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(248, 250, 252, .92);
+      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+      padding: 14px 16px 12px;
+    }
+
+    .top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .title {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 900;
+      letter-spacing: -.04em;
+    }
+
+    .subtitle {
+      margin-top: 3px;
       color: var(--muted);
-      line-height: 1.7;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .refresh {
+      border: 0;
+      background: var(--dark);
+      color: #fff;
+      border-radius: 999px;
+      padding: 10px 13px;
+      font-weight: 900;
       font-size: 13px;
+      cursor: pointer;
+    }
+
+    .screen {
+      display: none;
+      padding: 14px 14px 0;
+    }
+
+    .screen.active {
+      display: block;
+    }
+
+    .summary-card {
+      background: linear-gradient(135deg, #020617, #172554);
+      color: #fff;
+      border-radius: 24px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+      margin-bottom: 14px;
+    }
+
+    .summary-label {
+      font-size: 13px;
+      color: #bfdbfe;
+      font-weight: 800;
+    }
+
+    .summary-main {
+      margin-top: 6px;
+      font-size: 34px;
+      font-weight: 1000;
+      letter-spacing: -.06em;
+    }
+
+    .summary-sub {
+      margin-top: 8px;
+      color: #cbd5e1;
+      font-size: 13px;
+      line-height: 1.6;
       white-space: pre-wrap;
     }
 
-    .top-actions {
+    .month-strip {
       display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 16px;
-    }
-
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 7px;
-      min-height: 44px;
-      padding: 0 16px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      text-decoration: none;
-      font-weight: 900;
-      font-size: 14px;
-      cursor: pointer;
-      background: white;
-      color: var(--ink);
-    }
-
-    .btn.primary {
-      background: #0f172a;
-      color: white;
-      border-color: #0f172a;
-    }
-
-    .btn.blue {
-      background: var(--blue);
-      color: white;
-      border-color: var(--blue);
-    }
-
-    .btn.kakao {
-      background: var(--yellow);
-      border-color: #e8d000;
-      color: #191919;
-    }
-
-    .month-tabs {
-      display: grid;
-      grid-template-columns: repeat(12, 1fr);
       gap: 8px;
-      margin-bottom: 18px;
+      overflow-x: auto;
+      padding: 2px 0 14px;
+      scrollbar-width: none;
+    }
+
+    .month-strip::-webkit-scrollbar {
+      display: none;
     }
 
     .month-btn {
+      flex: 0 0 auto;
       border: 1px solid var(--line);
-      background: var(--soft);
+      background: #fff;
       color: var(--muted);
-      border-radius: 15px;
-      min-height: 52px;
-      cursor: pointer;
+      border-radius: 16px;
+      padding: 10px 12px;
+      min-width: 62px;
       font-weight: 900;
-      transition: .16s ease;
-    }
-
-    .month-btn:hover {
-      transform: translateY(-1px);
-      background: white;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(15, 23, 42, .04);
     }
 
     .month-btn.active {
-      background: #0f172a;
-      color: white;
-      border-color: #0f172a;
+      background: var(--dark);
+      color: #fff;
+      border-color: var(--dark);
     }
 
-    .month-summary {
+    .toolbar {
       display: grid;
-      grid-template-columns: 315px 1fr;
-      gap: 16px;
-    }
-
-    .month-kpi {
-      background: #0f172a;
-      color: white;
-      border-radius: 24px;
-      padding: 20px;
-    }
-
-    .month-kpi .big {
-      font-size: 44px;
-      font-weight: 1000;
-      letter-spacing: -.05em;
-      margin: 4px 0;
-    }
-
-    .month-kpi p {
-      color: #cbd5e1;
-      line-height: 1.7;
-      margin: 10px 0 0;
-      font-size: 14px;
-    }
-
-    .schedule-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 12px;
-    }
-
-    .schedule-mini {
-      border: 1px solid var(--line);
-      background: #fff;
-      border-radius: 18px;
-      padding: 15px;
-      cursor: pointer;
-      transition: .16s ease;
-      min-height: 152px;
-    }
-
-    .schedule-mini:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 14px 35px rgba(15, 23, 42, .09);
-    }
-
-    .schedule-mini.active {
-      border-color: #0f172a;
-      outline: 3px solid rgba(15, 23, 42, .08);
-    }
-
-    .schedule-mini .date {
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 800;
-    }
-
-    .schedule-mini h3 {
-      margin: 8px 0 4px;
-      font-size: 18px;
-      letter-spacing: -.03em;
-    }
-
-    .schedule-mini .sub {
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.5;
-    }
-
-    .filters {
-      margin: 22px 0;
-      padding: 15px;
-      display: grid;
-      grid-template-columns: 1fr 170px 170px 170px;
-      gap: 12px;
+      grid-template-columns: 1fr 96px;
+      gap: 8px;
+      margin-bottom: 12px;
     }
 
     input,
@@ -885,89 +736,66 @@ HTML_PAGE = r"""<!doctype html>
     textarea {
       width: 100%;
       border: 1px solid var(--line);
-      background: var(--soft);
-      border-radius: 18px;
-      padding: 0 16px;
+      background: #fff;
+      border-radius: 16px;
       outline: none;
-      color: var(--ink);
-      font-size: 15px;
+      font-size: 14px;
     }
 
     input,
     select {
-      height: 52px;
+      height: 44px;
+      padding: 0 12px;
     }
 
     textarea {
-      min-height: 170px;
-      padding: 14px 16px;
-      line-height: 1.7;
+      min-height: 220px;
+      padding: 12px;
       resize: vertical;
+      line-height: 1.65;
     }
 
-    input:focus,
-    select:focus,
-    textarea:focus {
-      background: white;
-      border-color: #94a3b8;
-    }
-
-    .main {
+    .ipo-list {
       display: grid;
-      grid-template-columns: 440px 1fr;
-      gap: 22px;
-      align-items: start;
-    }
-
-    .list {
-      display: grid;
-      gap: 15px;
+      gap: 12px;
     }
 
     .ipo-card {
-      padding: 19px;
-      cursor: pointer;
-      transition: .18s ease;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 16px;
+      box-shadow: var(--shadow);
     }
 
-    .ipo-card:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 22px 55px rgba(15, 23, 42, .12);
-    }
-
-    .ipo-card.active {
-      border-color: #0f172a;
-      outline: 3px solid rgba(15, 23, 42, .08);
-    }
-
-    .card-top {
+    .ipo-head {
       display: flex;
-      justify-content: space-between;
       align-items: flex-start;
-      gap: 14px;
+      justify-content: space-between;
+      gap: 12px;
     }
 
-    .ipo-card h3 {
+    .ipo-name {
+      font-size: 20px;
+      font-weight: 1000;
+      letter-spacing: -.04em;
       margin: 0;
-      font-size: 21px;
-      letter-spacing: -.03em;
     }
 
-    .sector {
+    .ipo-meta {
       margin-top: 5px;
       color: var(--muted);
-      font-size: 14px;
+      font-size: 13px;
+      line-height: 1.45;
     }
 
     .pill {
-      display: inline-flex;
-      align-items: center;
       border-radius: 999px;
-      padding: 6px 10px;
-      font-size: 12px;
+      padding: 6px 9px;
+      font-size: 11px;
       font-weight: 900;
-      border: 1px solid var(--line);
       white-space: nowrap;
+      border: 1px solid var(--line);
     }
 
     .pill.hot {
@@ -994,333 +822,293 @@ HTML_PAGE = r"""<!doctype html>
       border-color: #e2e8f0;
     }
 
-    .meta {
+    .card-grid {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 9px;
-      margin: 15px 0;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 14px;
     }
 
-    .meta div {
-      background: var(--soft);
-      padding: 13px;
+    .mini {
+      background: #f8fafc;
       border-radius: 16px;
+      padding: 11px;
     }
 
-    .meta small {
+    .mini span {
       display: block;
       color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
       margin-bottom: 4px;
     }
 
-    .meta b {
-      font-size: 14px;
+    .mini b {
+      font-size: 13px;
+    }
+
+    .card-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .btn {
+      height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 900;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .btn.dark {
+      background: var(--dark);
+      color: #fff;
+      border-color: var(--dark);
+    }
+
+    .btn.kakao {
+      background: var(--yellow);
+      color: #191919;
+      border-color: #e8d000;
+    }
+
+    .btn.blue {
+      background: var(--blue);
+      color: white;
+      border-color: var(--blue);
+    }
+
+    .detail-card {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .back {
+      display: inline-flex;
+      border: 0;
+      background: transparent;
+      color: var(--blue);
+      font-weight: 900;
+      margin-bottom: 10px;
+      padding: 0;
+      cursor: pointer;
+    }
+
+    .detail-title {
+      margin: 0;
+      font-size: 30px;
+      font-weight: 1000;
+      letter-spacing: -.06em;
+    }
+
+    .score-box {
+      margin: 14px 0;
+      background: #020617;
+      color: white;
+      border-radius: 20px;
+      padding: 16px;
     }
 
     .score-row {
       display: flex;
+      align-items: center;
       justify-content: space-between;
-      font-size: 14px;
+      font-size: 13px;
       margin-bottom: 8px;
     }
 
     .bar {
       height: 10px;
+      background: rgba(255, 255, 255, .18);
       border-radius: 999px;
-      background: #e2e8f0;
       overflow: hidden;
     }
 
     .bar span {
       display: block;
       height: 100%;
-      background: #0f172a;
       border-radius: 999px;
-    }
-
-    .detail {
-      position: sticky;
-      top: 22px;
-      padding: 28px;
-    }
-
-    .detail-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 18px;
-      align-items: flex-start;
-    }
-
-    .eyebrow {
-      color: var(--muted);
-      font-weight: 900;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-
-    .detail h2 {
-      margin: 0;
-      font-size: 40px;
-      letter-spacing: -.05em;
-    }
-
-    .detail-sub {
-      color: var(--muted);
-      margin-top: 7px;
-    }
-
-    .info-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 12px;
-      margin: 24px 0;
-    }
-
-    .info {
-      background: var(--soft);
-      border-radius: 19px;
-      padding: 17px;
-    }
-
-    .info small {
-      color: var(--muted);
-      font-weight: 800;
-    }
-
-    .info b {
-      display: block;
-      margin-top: 6px;
-      font-size: 15px;
-    }
-
-    .heat {
-      background: #020617;
-      color: white;
-      border-radius: 24px;
-      padding: 22px;
-      margin-bottom: 22px;
-    }
-
-    .heat .bar {
-      background: rgba(255, 255, 255, .18);
-    }
-
-    .heat .bar span {
       background: white;
     }
 
-    .heat p {
-      color: #cbd5e1;
-      line-height: 1.7;
-      font-size: 14px;
-      margin: 13px 0 0;
-    }
-
     .section {
-      margin: 18px 0;
+      margin-top: 16px;
     }
 
     .section h3 {
-      margin: 0 0 8px;
-      font-size: 17px;
+      margin: 0 0 7px;
+      font-size: 16px;
     }
 
     .section .box {
-      border: 1px solid #eef2f7;
-      border-radius: 19px;
-      padding: 17px;
+      background: #f8fafc;
+      border-radius: 18px;
+      padding: 13px;
       color: var(--muted);
-      line-height: 1.8;
-      font-size: 15px;
+      line-height: 1.7;
+      font-size: 14px;
+      white-space: pre-wrap;
     }
 
     .risk {
       margin: 0;
-      padding-left: 19px;
+      padding-left: 18px;
     }
 
     .risk li {
-      margin: 6px 0;
+      margin: 5px 0;
     }
 
-    .buttons {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 22px;
-    }
-
-    .loading {
-      padding: 25px;
-      text-align: center;
+    .status-box {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 16px;
+      box-shadow: var(--shadow);
       color: var(--muted);
+      line-height: 1.7;
+      white-space: pre-wrap;
+      font-size: 13px;
+    }
+
+    .bottom-nav {
+      position: fixed;
+      left: 50%;
+      bottom: 0;
+      transform: translateX(-50%);
+      width: min(520px, 100%);
+      background: rgba(255, 255, 255, .94);
+      backdrop-filter: blur(16px);
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      padding: 8px 8px max(8px, env(safe-area-inset-bottom));
+      z-index: 30;
+    }
+
+    .nav-btn {
+      border: 0;
+      background: transparent;
+      border-radius: 14px;
+      padding: 8px 4px;
+      color: var(--muted);
+      font-size: 12px;
       font-weight: 900;
+      cursor: pointer;
     }
 
-    @media(max-width:1120px) {
-      .hero-grid,
-      .main,
-      .month-summary {
-        grid-template-columns: 1fr;
-      }
-
-      .detail {
-        position: static;
-      }
-
-      .filters {
-        grid-template-columns: 1fr;
-      }
-
-      .schedule-grid {
-        grid-template-columns: 1fr;
-      }
-
-      .month-tabs {
-        grid-template-columns: repeat(4, 1fr);
-      }
+    .nav-btn.active {
+      background: #eff6ff;
+      color: var(--blue);
     }
 
-    @media(max-width:640px) {
-      .hero {
-        padding: 26px 20px;
-        border-radius: 26px;
-      }
-
-      h1 {
-        font-size: 34px;
-        line-height: 1.08;
-      }
-
-      .hero p {
-        font-size: 15px;
-      }
-
-      .stat {
-        padding: 13px;
-      }
-
-      .source-panel,
-      .month-area,
-      .share-panel,
-      .detail {
-        padding: 18px;
-        border-radius: 22px;
-      }
-
-      .month-tabs {
-        grid-template-columns: repeat(3, 1fr);
-      }
-
-      .month-btn {
-        min-height: 48px;
-      }
-
-      .detail h2 {
-        font-size: 32px;
-      }
-
-      .info-grid,
-      .meta {
-        grid-template-columns: 1fr;
-      }
-
-      .btn {
-        width: 100%;
-      }
-
-      .top-actions,
-      .buttons {
-        display: grid;
-        grid-template-columns: 1fr;
-      }
+    .empty {
+      background: #fff;
+      border: 1px dashed var(--line);
+      color: var(--muted);
+      border-radius: 22px;
+      padding: 22px;
+      text-align: center;
+      line-height: 1.7;
+      font-weight: 800;
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <section class="hero">
-      <div class="hero-grid">
+  <div class="app">
+    <header class="top">
+      <div class="top-row">
         <div>
-          <div class="badge">✓ DART · KRX KIND · Public Sources</div>
-          <h1>공모주 청약일정을 공개 웹페이지에서 자동 수집하는 웹</h1>
-          <p>DART 청약달력, KRX KIND, 기타 공개 공모주 페이지를 순서대로 읽어 월별 일정·회사개요·전망·흥행 판단·카카오톡 공유 문구를 구성합니다.</p>
+          <h1 class="title">공모주 인사이트</h1>
+          <div class="subtitle">모바일 전용 자동수집 웹</div>
         </div>
-        <div class="statbox">
-          <div class="stat"><span>선택월 공모주</span><strong id="statMonthCount">0개</strong></div>
-          <div class="stat"><span>전체 수집 종목</span><strong id="statAllCount">0개</strong></div>
-          <div class="stat"><span>마지막 갱신</span><strong id="statUpdated">-</strong></div>
-        </div>
+        <button class="refresh" onclick="loadData(true)">새로고침</button>
       </div>
+    </header>
+
+    <section id="screenMonthly" class="screen active">
+      <div class="summary-card">
+        <div class="summary-label">이번 달 청약 일정</div>
+        <div id="summaryMain" class="summary-main">0개</div>
+        <div id="summarySub" class="summary-sub">데이터를 불러오는 중입니다.</div>
+      </div>
+
+      <div id="monthStrip" class="month-strip"></div>
+
+      <div class="toolbar">
+        <input id="searchInput" placeholder="종목 검색" />
+        <select id="sortSelect">
+          <option value="date">청약일순</option>
+          <option value="score">흥행순</option>
+          <option value="name">이름순</option>
+        </select>
+      </div>
+
+      <div id="monthlyList" class="ipo-list"></div>
     </section>
 
-    <section class="source-panel">
-      <h2>자동 수집 상태</h2>
-      <div class="notice">
-        API 키 없이 공개 웹페이지를 읽는 방식입니다. 특정 사이트가 SSL 오류나 timeout으로 막혀도 DART/KRX 등 다른 소스를 순서대로 시도합니다.
+    <section id="screenAll" class="screen">
+      <div class="summary-card">
+        <div class="summary-label">전체 수집 종목</div>
+        <div id="allSummaryMain" class="summary-main">0개</div>
+        <div id="allSummarySub" class="summary-sub">DART/KRX 공개 페이지 기준 자동 수집</div>
       </div>
-      <div class="top-actions">
-        <button class="btn primary" onclick="loadData(true)">인터넷에서 새로고침</button>
-        <button class="btn blue" onclick="loadData(false)">캐시 불러오기</button>
-        <a class="btn" href="https://dart.fss.or.kr/dsac008/main.do" target="_blank">DART 청약달력 ↗</a>
-        <a class="btn" href="https://kind.krx.co.kr/listinvstg/pubofrschdl.do?method=searchPubofrScholMain" target="_blank">KRX KIND ↗</a>
-      </div>
-      <div id="sourceStatus" class="source-status">수집 상태 확인 중...</div>
+      <div id="allList" class="ipo-list"></div>
     </section>
 
-    <section class="month-area">
-      <h2>월별 공모주 청약 일정 요약</h2>
-      <div id="monthTabs" class="month-tabs"></div>
-      <div class="month-summary">
-        <div class="month-kpi">
-          <div id="monthTitle">월 선택</div>
-          <div class="big" id="monthCount">0개</div>
-          <p id="monthComment">인터넷에서 데이터를 불러오는 중입니다.</p>
-        </div>
-        <div id="scheduleGrid" class="schedule-grid"><div class="loading">데이터 로딩 중...</div></div>
+    <section id="screenStatus" class="screen">
+      <div class="summary-card">
+        <div class="summary-label">자동 수집 상태</div>
+        <div class="summary-main">상태</div>
+        <div class="summary-sub">각 소스별 성공/실패를 확인합니다.</div>
       </div>
+      <div id="statusBox" class="status-box">수집 상태 확인 중...</div>
     </section>
 
-    <section class="filters">
-      <input id="search" placeholder="회사명, 업종, 주관사 검색" />
-      <select id="market">
-        <option>전체</option>
-        <option>KOSDAQ</option>
-        <option>KOSPI</option>
-        <option>SPAC</option>
-        <option>확인 필요</option>
-      </select>
-      <select id="sort">
-        <option value="date">청약일순</option>
-        <option value="score">흥행점수순</option>
-        <option value="name">가나다순</option>
-      </select>
-      <select id="viewMode">
-        <option value="month">선택월만 보기</option>
-        <option value="all">전체 보기</option>
-      </select>
+    <section id="screenShare" class="screen">
+      <div class="summary-card">
+        <div class="summary-label">이번 달 공유 문구</div>
+        <div class="summary-main">공유</div>
+        <div class="summary-sub">이번 달 청약 일정을 카카오톡에 붙여넣기 좋게 정리합니다.</div>
+      </div>
+      <textarea id="monthShareText" readonly></textarea>
+      <div style="height:10px;"></div>
+      <button class="btn kakao" style="width:100%;" onclick="copyMonthShare()">이번 달 일정 복사</button>
     </section>
 
-    <main class="main">
-      <div>
-        <div id="list" class="list"><div class="ipo-card">데이터 로딩 중...</div></div>
-        <section class="share-panel">
-          <h2>카카오톡으로 보낼 내용</h2>
-          <textarea id="shareText" readonly></textarea>
-          <div class="buttons">
-            <button class="btn kakao" onclick="copyShareText()">카카오톡 문구 복사</button>
-          </div>
-        </section>
-      </div>
-      <aside id="detail" class="detail"></aside>
-    </main>
+    <section id="screenDetail" class="screen">
+      <button class="back" onclick="goBack()">← 목록으로</button>
+      <div id="detailView" class="detail-card"></div>
+    </section>
+
+    <nav class="bottom-nav">
+      <button id="navMonthly" class="nav-btn active" onclick="showScreen('monthly')">월별</button>
+      <button id="navAll" class="nav-btn" onclick="showScreen('all')">전체</button>
+      <button id="navStatus" class="nav-btn" onclick="showScreen('status')">수집상태</button>
+      <button id="navShare" class="nav-btn" onclick="showScreen('share')">공유</button>
+    </nav>
   </div>
 
   <script>
     let ipos = [];
+    let statusData = {};
     const YEAR = new Date().getFullYear();
     let selectedMonth = new Date().getMonth() + 1;
     let selectedId = null;
+    let prevScreen = "monthly";
+
     const $ = id => document.getElementById(id);
 
     function escapeHtml(value) {
@@ -1332,115 +1120,84 @@ HTML_PAGE = r"""<!doctype html>
         .replaceAll("'", "&#039;");
     }
 
-    function getMonth(dateString) {
+    function monthOf(dateString) {
       return dateString ? Number(String(dateString).slice(5, 7)) : 0;
+    }
+
+    function md(dateString) {
+      if (!dateString || dateString.length < 10) return "미정";
+      return dateString.slice(5).replace("-", ".");
     }
 
     function getStatus(score) {
       score = Number(score || 0);
-
       if (score >= 80) return ["hot", "흥행 강함"];
       if (score >= 65) return ["good", "관심 높음"];
       if (score >= 50) return ["watch", "관망 필요"];
-
       return ["weak", "주의"];
     }
 
-    function scoreBar(score) {
-      score = Number(score || 0);
-
-      return `
-        <div class="score-row"><span>흥행 점수</span><b>${score}/100</b></div>
-        <div class="bar"><span style="width:${Math.max(0, Math.min(100, score))}%"></span></div>
-      `;
-    }
-
-    function monthItems() {
+    function currentMonthItems() {
       return ipos
-        .filter(item => getMonth(item.subscriptionStart) === selectedMonth)
+        .filter(item => monthOf(item.subscriptionStart) === selectedMonth)
         .sort((a, b) => new Date(a.subscriptionStart) - new Date(b.subscriptionStart));
     }
 
-    function targetItems() {
-      return $("viewMode").value === "all" ? ipos : monthItems();
+    function filteredMonthlyItems() {
+      const query = $("searchInput").value.toLowerCase();
+      const sort = $("sortSelect").value;
+      return currentMonthItems()
+        .filter(item => `${item.name} ${item.sector} ${item.manager}`.toLowerCase().includes(query))
+        .sort(sortItems(sort));
     }
 
-    function currentIpo() {
-      return ipos.find(item => item.id === selectedId) || monthItems()[0] || ipos[0];
+    function sortItems(sort) {
+      return function(a, b) {
+        if (sort === "score") return Number(b.score || 0) - Number(a.score || 0);
+        if (sort === "name") return String(a.name).localeCompare(String(b.name), "ko");
+        return new Date(a.subscriptionStart) - new Date(b.subscriptionStart);
+      };
     }
 
     async function loadData(force = false) {
-      $("list").innerHTML = `<div class="ipo-card">인터넷 공모주 데이터를 불러오는 중...</div>`;
-      $("sourceStatus").textContent = "수집 중...";
+      $("statusBox").textContent = "수집 중...";
+      $("monthlyList").innerHTML = `<div class="empty">인터넷 공모주 데이터를 불러오는 중입니다.</div>`;
 
       try {
         const response = await fetch(`/api/ipos?year=${YEAR}&force=${force ? 1 : 0}`);
         const data = await response.json();
 
         ipos = data.items || [];
-        $("statUpdated").textContent = data.cachedAtText ? data.cachedAtText.slice(5, 16) : "-";
+        statusData = data || {};
 
-        const statusLines = [];
-        statusLines.push(`전체 수집 종목: ${data.count || 0}개`);
-        statusLines.push(`소스별 수집: ${JSON.stringify(data.sourceCounts || {}, null, 2)}`);
-
-        if (data.errors && data.errors.length) {
-          statusLines.push("수집 실패/경고:");
-          data.errors.forEach(error => statusLines.push("- " + error));
-        }
-
-        if (data.note) {
-          statusLines.push(data.note);
-        }
-
-        $("sourceStatus").textContent = statusLines.join("\n");
-
-        const currentMonthFirst = monthItems()[0];
-
-        if (currentMonthFirst) {
-          selectedId = currentMonthFirst.id;
+        const current = currentMonthItems()[0];
+        if (current) {
+          selectedId = current.id;
         } else if (ipos[0]) {
-          selectedMonth = getMonth(ipos[0].subscriptionStart);
+          selectedMonth = monthOf(ipos[0].subscriptionStart);
           selectedId = ipos[0].id;
         }
 
         renderAll();
       } catch (error) {
-        $("sourceStatus").textContent = "수집 실패: " + error.message;
-        $("list").innerHTML = `
-          <div class="ipo-card">
-            <h3>수집 실패</h3>
-            <div class="sector">Render 서버가 켜져 있는지 확인하세요. 잠시 후 새로고침을 다시 눌러도 됩니다.</div>
-          </div>
-        `;
-        $("scheduleGrid").innerHTML = `<div class="loading">수집 실패: ${escapeHtml(error.message)}</div>`;
+        $("statusBox").textContent = "수집 실패: " + error.message;
+        $("monthlyList").innerHTML = `<div class="empty">수집 실패<br>${escapeHtml(error.message)}</div>`;
       }
     }
 
-    function filteredList() {
-      const query = $("search").value.toLowerCase();
-      const market = $("market").value;
-      const sort = $("sort").value;
-
-      return targetItems()
-        .filter(item => {
-          const text = `${item.name} ${item.sector} ${item.manager}`.toLowerCase();
-
-          return text.includes(query) && (market === "전체" || item.market === market);
-        })
-        .sort((a, b) => {
-          if (sort === "score") return Number(b.score || 0) - Number(a.score || 0);
-          if (sort === "name") return a.name.localeCompare(b.name, "ko");
-
-          return new Date(a.subscriptionStart) - new Date(b.subscriptionStart);
-        });
+    function renderAll() {
+      renderMonths();
+      renderSummary();
+      renderMonthlyList();
+      renderAllList();
+      renderStatus();
+      renderMonthShare();
     }
 
-    function renderMonthTabs() {
-      $("monthTabs").innerHTML = Array.from({ length: 12 }, (_, index) => {
+    function renderMonths() {
+      $("monthStrip").innerHTML = Array.from({ length: 12 }, (_, index) => {
         const month = index + 1;
-        const count = ipos.filter(item => getMonth(item.subscriptionStart) === month).length;
-
+        const count = ipos.filter(item => monthOf(item.subscriptionStart) === month).length;
         return `
           <button class="month-btn ${month === selectedMonth ? "active" : ""}" onclick="selectMonth(${month})">
             ${month}월<br><small>${count}개</small>
@@ -1449,145 +1206,142 @@ HTML_PAGE = r"""<!doctype html>
       }).join("");
     }
 
-    function renderMonthSummary() {
-      const items = monthItems();
+    function renderSummary() {
+      const items = currentMonthItems();
       const avg = items.length
         ? Math.round(items.reduce((sum, item) => sum + Number(item.score || 0), 0) / items.length)
         : 0;
+      const good = items.filter(item => Number(item.score || 0) >= 65).length;
 
-      $("monthTitle").textContent = `${YEAR}년 ${selectedMonth}월`;
-      $("monthCount").textContent = `${items.length}개`;
-      $("monthComment").textContent = items.length
-        ? `선택월 평균 흥행점수는 ${avg}점입니다. 종목을 누르면 상세 분석이 표시됩니다.`
-        : "이 월에는 수집된 청약 일정이 없습니다.";
+      $("summaryMain").textContent = `${items.length}개`;
+      $("summarySub").textContent = items.length
+        ? `${YEAR}년 ${selectedMonth}월 · 평균 흥행점수 ${avg}점\n관심 높은 종목 ${good}개`
+        : `${YEAR}년 ${selectedMonth}월 수집 일정 없음`;
 
-      $("scheduleGrid").innerHTML = items.length
-        ? items.map(item => {
-            const [key, label] = getStatus(item.score);
-
-            return `
-              <article class="schedule-mini ${item.id === selectedId ? "active" : ""}" onclick="selectIpo('${escapeHtml(item.id)}')">
-                <div class="date">${escapeHtml(item.subscriptionStart)} ~ ${escapeHtml(String(item.subscriptionEnd || "").slice(5))}</div>
-                <h3>${escapeHtml(item.name)}</h3>
-                <div class="sub">${escapeHtml(item.market)} · ${escapeHtml(item.sector)}<br>${escapeHtml(item.manager || "주관사 확인 필요")}</div>
-                <div style="margin-top:10px;"><span class="pill ${key}">${label}</span></div>
-              </article>
-            `;
-          }).join("")
-        : `<div class="loading">수집된 일정이 없습니다. 위의 자동 수집 상태에서 실패 원인을 확인하세요.</div>`;
+      $("allSummaryMain").textContent = `${ipos.length}개`;
+      $("allSummarySub").textContent = statusData.cachedAtText
+        ? `마지막 갱신: ${statusData.cachedAtText}`
+        : "DART/KRX 공개 페이지 기준 자동 수집";
     }
 
-    function renderStats() {
-      $("statMonthCount").textContent = `${monthItems().length}개`;
-      $("statAllCount").textContent = `${ipos.length}개`;
+    function renderMonthlyList() {
+      const items = filteredMonthlyItems();
+      $("monthlyList").innerHTML = items.length
+        ? items.map(renderCard).join("")
+        : `<div class="empty">이 월에는 수집된 청약 일정이 없습니다.<br>수집상태 탭에서 실패 원인을 확인하세요.</div>`;
     }
 
-    function renderList() {
-      const list = filteredList();
+    function renderAllList() {
+      const all = [...ipos].sort((a, b) => new Date(a.subscriptionStart) - new Date(b.subscriptionStart));
+      $("allList").innerHTML = all.length
+        ? all.map(renderCard).join("")
+        : `<div class="empty">수집된 공모주가 없습니다.</div>`;
+    }
 
-      $("list").innerHTML = list.length
-        ? list.map(item => {
-            const [key, label] = getStatus(item.score);
+    function renderCard(item) {
+      const [key, label] = getStatus(item.score);
+      return `
+        <article class="ipo-card">
+          <div class="ipo-head">
+            <div>
+              <h2 class="ipo-name">${escapeHtml(item.name)}</h2>
+              <div class="ipo-meta">${escapeHtml(item.market)} · ${escapeHtml(item.sector)}</div>
+            </div>
+            <span class="pill ${key}">${label}</span>
+          </div>
 
-            return `
-              <article class="ipo-card ${item.id === selectedId ? "active" : ""}" onclick="selectIpo('${escapeHtml(item.id)}')">
-                <div class="card-top">
-                  <div>
-                    <h3>${escapeHtml(item.name)} <span class="pill weak">${escapeHtml(item.market)}</span></h3>
-                    <div class="sector">${escapeHtml(item.sector || "")}</div>
-                  </div>
-                  <span class="pill ${key}">${label}</span>
-                </div>
-                <div class="meta">
-                  <div><small>청약일</small><b>${escapeHtml(item.subscriptionStart)} ~ ${escapeHtml(String(item.subscriptionEnd || "").slice(5))}</b></div>
-                  <div><small>주관사</small><b>${escapeHtml(item.manager || "확인 필요")}</b></div>
-                </div>
-                ${scoreBar(item.score)}
-              </article>
-            `;
-          }).join("")
-        : `
-          <article class="ipo-card">
-            <h3>검색 결과 없음</h3>
-            <div class="sector">조건에 맞는 종목이 없습니다.</div>
-          </article>
-        `;
+          <div class="card-grid">
+            <div class="mini"><span>청약일</span><b>${md(item.subscriptionStart)} ~ ${md(item.subscriptionEnd)}</b></div>
+            <div class="mini"><span>흥행점수</span><b>${Number(item.score || 0)}점</b></div>
+            <div class="mini"><span>주관사</span><b>${escapeHtml(item.manager || "확인 필요")}</b></div>
+            <div class="mini"><span>공모가</span><b>${escapeHtml(item.priceBand || "확인 필요")}</b></div>
+          </div>
 
-      renderDetail();
-      renderShareText();
+          <div class="card-actions">
+            <button class="btn dark" onclick="openDetail('${escapeHtml(item.id)}')">자세히</button>
+            <button class="btn kakao" onclick="copyItemShare('${escapeHtml(item.id)}')">카톡복사</button>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderStatus() {
+      const lines = [];
+      lines.push(`전체 수집 종목: ${statusData.count || 0}개`);
+      lines.push(`마지막 갱신: ${statusData.cachedAtText || "-"}`);
+      lines.push("");
+      lines.push("소스별 수집:");
+      lines.push(JSON.stringify(statusData.sourceCounts || {}, null, 2));
+
+      if (statusData.errors && statusData.errors.length) {
+        lines.push("");
+        lines.push("실패/경고:");
+        statusData.errors.forEach(error => lines.push("- " + error));
+      }
+
+      if (statusData.note) {
+        lines.push("");
+        lines.push(statusData.note);
+      }
+
+      $("statusBox").textContent = lines.join("\n");
     }
 
     function renderDetail() {
-      const item = currentIpo();
+      const item = ipos.find(row => row.id === selectedId);
 
       if (!item) {
-        $("detail").innerHTML = `<div class="eyebrow">NO DATA</div><h2>데이터 없음</h2><p class="detail-sub">위의 자동 수집 상태를 확인하세요.</p>`;
-
+        $("detailView").innerHTML = `<div class="empty">종목을 찾을 수 없습니다.</div>`;
         return;
       }
 
       const [key, label] = getStatus(item.score);
 
-      $("detail").innerHTML = `
-        <div class="detail-head">
+      $("detailView").innerHTML = `
+        <div class="ipo-head">
           <div>
-            <div class="eyebrow">IPO ANALYSIS</div>
-            <h2>${escapeHtml(item.name)}</h2>
-            <div class="detail-sub">${escapeHtml(item.market)} · ${escapeHtml(item.sector || "")}</div>
+            <h2 class="detail-title">${escapeHtml(item.name)}</h2>
+            <div class="ipo-meta">${escapeHtml(item.market)} · ${escapeHtml(item.sector)}</div>
           </div>
           <span class="pill ${key}">${label}</span>
         </div>
 
-        <div class="info-grid">
-          <div class="info"><small>청약 일정</small><b>${escapeHtml(item.subscriptionStart)} ~ ${escapeHtml(item.subscriptionEnd)}</b></div>
-          <div class="info"><small>주관사</small><b>${escapeHtml(item.manager || "확인 필요")}</b></div>
-          <div class="info"><small>희망 공모가</small><b>${escapeHtml(item.priceBand || "확인 필요")}</b></div>
-          <div class="info"><small>청약경쟁률</small><b>${escapeHtml(item.competitionRate || "예정")}</b></div>
+        <div class="score-box">
+          <div class="score-row"><span>흥행 점수</span><b>${Number(item.score || 0)}/100</b></div>
+          <div class="bar"><span style="width:${Math.max(0, Math.min(100, Number(item.score || 0)))}%"></span></div>
         </div>
 
-        <div class="heat">
-          <b>흥행 판단</b>
-          <div style="margin-top:14px;">${scoreBar(item.score)}</div>
-          <p>수집된 공모가, 청약경쟁률, 업종 키워드를 바탕으로 자동 산정한 참고 점수입니다. 수요예측과 보호예수 정보가 추가되면 더 정확해집니다.</p>
+        <div class="card-grid">
+          <div class="mini"><span>청약일</span><b>${md(item.subscriptionStart)} ~ ${md(item.subscriptionEnd)}</b></div>
+          <div class="mini"><span>주관사</span><b>${escapeHtml(item.manager || "확인 필요")}</b></div>
+          <div class="mini"><span>희망 공모가</span><b>${escapeHtml(item.priceBand || "확인 필요")}</b></div>
+          <div class="mini"><span>청약경쟁률</span><b>${escapeHtml(item.competitionRate || "예정")}</b></div>
         </div>
 
-        <div class="section"><h3>회사 개요</h3><div class="box">${escapeHtml(item.overview || "회사개요 확인 필요")}</div></div>
-        <div class="section"><h3>회사 전망</h3><div class="box">${escapeHtml(item.outlook || "전망 확인 필요")}</div></div>
-        <div class="section"><h3>체크해야 할 리스크</h3><div class="box"><ul class="risk">${(item.risks || []).map(risk => `<li>${escapeHtml(risk)}</li>`).join("")}</ul></div></div>
-        <div class="section"><h3>출처</h3><div class="box">${escapeHtml(item.source || "")} ${item.detailUrl ? `<br><a href="${escapeHtml(item.detailUrl)}" target="_blank">상세 원본 보기 ↗</a>` : ""}</div></div>
+        <div class="section"><h3>회사개요</h3><div class="box">${escapeHtml(item.overview || "확인 필요")}</div></div>
+        <div class="section"><h3>전망</h3><div class="box">${escapeHtml(item.outlook || "확인 필요")}</div></div>
+        <div class="section"><h3>리스크</h3><div class="box"><ul class="risk">${(item.risks || []).map(risk => `<li>${escapeHtml(risk)}</li>`).join("")}</ul></div></div>
+        <div class="section"><h3>출처</h3><div class="box">${escapeHtml(item.source || "확인 필요")}</div></div>
 
-        <div class="buttons">
-          ${item.detailUrl ? `<a class="btn primary" href="${escapeHtml(item.detailUrl)}" target="_blank">원본 상세 ↗</a>` : ""}
-          <a class="btn" href="${escapeHtml(item.sourceUrl || "https://dart.fss.or.kr/dsac008/main.do")}" target="_blank">출처 페이지 ↗</a>
-          <button class="btn kakao" onclick="copyShareText()">카카오톡 문구 복사</button>
+        <div class="card-actions">
+          <button class="btn kakao" onclick="copyItemShare('${escapeHtml(item.id)}')">카카오톡 문구 복사</button>
+          <a class="btn blue" href="${escapeHtml(item.detailUrl || item.sourceUrl || "https://dart.fss.or.kr/dsac008/main.do")}" target="_blank">원본 확인</a>
         </div>
       `;
     }
 
-    function makeShareText() {
-      const item = currentIpo();
-      const items = monthItems();
+    function itemShareText(item) {
+      if (!item) return "공모주 데이터가 없습니다.";
 
-      if (!item) {
-        return "공모주 데이터가 없습니다.";
-      }
+      return `[공모주 인사이트]
 
-      const monthLine = items
-        .map(row => `- ${row.name}: ${row.subscriptionStart}~${String(row.subscriptionEnd || "").slice(5)} / ${row.manager || "주관사 확인"} / ${getStatus(row.score)[1]}`)
-        .join("\n");
-
-      return `[공모주 인사이트] ${YEAR}년 ${selectedMonth}월 청약 일정
-
-월간 요약: 총 ${items.length}개
-${monthLine || "- 수집된 일정 없음"}
-
-선택 종목: ${item.name}
+종목: ${item.name}
+청약일: ${md(item.subscriptionStart)} ~ ${md(item.subscriptionEnd)}
 시장/업종: ${item.market} / ${item.sector}
-청약일: ${item.subscriptionStart} ~ ${item.subscriptionEnd}
 주관사: ${item.manager}
 희망 공모가: ${item.priceBand}
 청약경쟁률: ${item.competitionRate}
-흥행 판단: ${getStatus(item.score)[1]} (${item.score}/100)
+흥행판단: ${getStatus(item.score)[1]} (${item.score}/100)
 
 회사개요:
 ${item.overview}
@@ -1601,55 +1355,97 @@ ${(item.risks || []).map(risk => "- " + risk).join("\n")}
 ※ 투자 권유가 아닌 정보 정리용 요약입니다.`;
     }
 
-    function renderShareText() {
-      $("shareText").value = makeShareText();
+    function renderMonthShare() {
+      const items = currentMonthItems();
+      const lines = [];
+
+      lines.push(`[공모주 인사이트] ${YEAR}년 ${selectedMonth}월 청약 일정`);
+      lines.push("");
+      lines.push(`총 ${items.length}개 수집`);
+      lines.push("");
+
+      if (items.length) {
+        items.forEach(item => {
+          lines.push(`- ${item.name}: ${md(item.subscriptionStart)}~${md(item.subscriptionEnd)} / ${getStatus(item.score)[1]} / ${item.manager}`);
+        });
+      } else {
+        lines.push("- 수집된 일정 없음");
+      }
+
+      lines.push("");
+      lines.push("※ 투자 권유가 아닌 정보 정리용 요약입니다.");
+
+      $("monthShareText").value = lines.join("\n");
     }
 
-    async function copyShareText() {
+    async function copyText(text) {
       try {
-        await navigator.clipboard.writeText($("shareText").value);
+        await navigator.clipboard.writeText(text);
         alert("카카오톡에 붙여넣을 문구를 복사했습니다.");
       } catch (error) {
-        $("shareText").select();
-        document.execCommand("copy");
-        alert("복사했습니다.");
+        alert("복사에 실패했습니다. 텍스트를 직접 선택해 복사해 주세요.");
       }
+    }
+
+    function copyItemShare(id) {
+      const item = ipos.find(row => row.id === id);
+      copyText(itemShareText(item));
+    }
+
+    function copyMonthShare() {
+      copyText($("monthShareText").value);
     }
 
     function selectMonth(month) {
       selectedMonth = month;
-
-      const first = monthItems()[0];
-
-      if (first) {
-        selectedId = first.id;
-      }
-
+      const first = currentMonthItems()[0];
+      if (first) selectedId = first.id;
       renderAll();
     }
 
-    function selectIpo(id) {
+    function openDetail(id) {
       selectedId = id;
+      prevScreen = document.querySelector(".screen.active")?.id === "screenAll" ? "all" : "monthly";
+      renderDetail();
+      showScreen("detail");
+    }
 
-      const item = ipos.find(row => row.id === id);
+    function goBack() {
+      showScreen(prevScreen || "monthly");
+    }
 
-      if (item) {
-        selectedMonth = getMonth(item.subscriptionStart);
+    function showScreen(name) {
+      ["Monthly", "All", "Status", "Share", "Detail"].forEach(key => {
+        const screen = $("screen" + key);
+        if (screen) screen.classList.remove("active");
+      });
+
+      ["Monthly", "All", "Status", "Share"].forEach(key => {
+        const nav = $("nav" + key);
+        if (nav) nav.classList.remove("active");
+      });
+
+      if (name === "monthly") {
+        $("screenMonthly").classList.add("active");
+        $("navMonthly").classList.add("active");
+      } else if (name === "all") {
+        $("screenAll").classList.add("active");
+        $("navAll").classList.add("active");
+      } else if (name === "status") {
+        $("screenStatus").classList.add("active");
+        $("navStatus").classList.add("active");
+      } else if (name === "share") {
+        $("screenShare").classList.add("active");
+        $("navShare").classList.add("active");
+      } else if (name === "detail") {
+        $("screenDetail").classList.add("active");
       }
 
-      renderAll();
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
-    function renderAll() {
-      renderMonthTabs();
-      renderStats();
-      renderMonthSummary();
-      renderList();
-    }
-
-    ["search", "market", "sort", "viewMode"].forEach(id => {
-      $(id).addEventListener("input", renderList);
-    });
+    $("searchInput").addEventListener("input", renderMonthlyList);
+    $("sortSelect").addEventListener("input", renderMonthlyList);
 
     loadData(false);
   </script>
@@ -1667,7 +1463,6 @@ def index():
 def api_ipos():
     force = request.args.get("force") == "1"
     year = request.args.get("year", type=int) or datetime.now().year
-
     return jsonify(collect_ipos(force=force, year=year))
 
 
@@ -1677,9 +1472,9 @@ def health():
         {
             "ok": True,
             "time": datetime.now().isoformat(),
-            "mode": "public-page-scraper-single-file",
+            "mode": "mobile-final-single-file",
             "sources": SOURCES,
-            "message": "DART/KRX API 키 없이 공개 웹페이지를 순서대로 읽습니다.",
+            "message": "모바일 전용 UI와 공개 웹페이지 자동수집을 사용합니다.",
         }
     )
 
@@ -1690,6 +1485,6 @@ def not_found(_error):
 
 
 if __name__ == "__main__":
-    print("공모주 인사이트 자동수집 웹 - PUBLIC SOURCES FINAL")
+    print("공모주 인사이트 모바일 최종본")
     print("브라우저에서 http://127.0.0.1:5077 로 접속하세요.")
     app.run(host="127.0.0.1", port=5077, debug=True)
