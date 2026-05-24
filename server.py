@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-공모주 인사이트 자동수집 웹 - Render FIX FULL VERSION
+공모주 인사이트 자동수집 웹 - PUBLIC SOURCES FINAL
+
+목표:
+  - DART/KRX API 인증키 없이 공개 웹페이지를 읽어 공모주 일정을 자동 수집
+  - 1순위 DART 청약달력 웹페이지
+  - 2순위 KRX KIND 공모일정 웹페이지
+  - 3순위 38커뮤니케이션 / IPO38 보조 수집
+  - public/Profile 폴더가 없어도 server.py 단일 파일만으로 첫 화면 제공
+  - Render 배포 시 Not Found 방지
 
 Render Start Command:
   gunicorn server:app --bind 0.0.0.0:$PORT
@@ -9,12 +17,6 @@ Render Start Command:
   pip install -r requirements.txt
   python server.py
   http://127.0.0.1:5077 접속
-
-핵심 수정:
-  - public/Profile 폴더가 없어도 첫 화면이 열리도록 HTML을 server.py 안에 포함
-  - Render 404 Not Found 문제 방지
-  - /api/ipos 자동수집 유지
-  - /api/health 상태 확인 가능
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, request, Response
+from flask import Flask, Response, jsonify, request
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -45,21 +47,35 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "close",
 }
 
 SOURCES = [
     {
+        "name": "DART 청약달력",
+        "url": "https://dart.fss.or.kr/dsac008/main.do",
+        "base": "https://dart.fss.or.kr",
+        "type": "dart_calendar",
+    },
+    {
+        "name": "KRX KIND 공모일정",
+        "url": "https://kind.krx.co.kr/listinvstg/pubofrschdl.do?method=searchPubofrScholMain",
+        "base": "https://kind.krx.co.kr",
+        "type": "generic_table",
+    },
+    {
         "name": "38커뮤니케이션",
         "url": "https://www.38.co.kr/html/fund/?o=k",
         "base": "https://www.38.co.kr",
-        "type": "38",
+        "type": "generic_table",
     },
     {
         "name": "IPO38",
         "url": "https://www.ipo38.co.kr/ipo/?key=6",
         "base": "https://www.ipo38.co.kr",
-        "type": "38",
+        "type": "generic_table",
     },
 ]
 
@@ -102,6 +118,7 @@ def parse_korean_number(text: str) -> Optional[float]:
         .replace(":", "")
         .replace("대1", "")
         .replace("원", "")
+        .replace("%", "")
         .strip()
     )
 
@@ -117,17 +134,12 @@ def parse_korean_number(text: str) -> Optional[float]:
 
 
 def normalize_date_range(text: str, default_year: int) -> Optional[Tuple[str, str]]:
-    """
-    2026.07.01~07.02
-    05.11 ~ 05.12
-    2026/05/11~2026/05/12
-    같은 문자열을 YYYY-MM-DD 두 개로 변환한다.
-    """
     if not text:
         return None
 
     raw = normalize_space(text)
     raw = raw.replace("/", ".").replace("-", ".")
+    raw = raw.replace("년", ".").replace("월", ".").replace("일", "")
     raw = re.sub(r"\s+", "", raw)
 
     match = re.search(
@@ -158,7 +170,7 @@ def normalize_date_range(text: str, default_year: int) -> Optional[Tuple[str, st
 
 
 def fetch_html(url: str) -> str:
-    response = requests.get(url, headers=HEADERS, timeout=15)
+    response = requests.get(url, headers=HEADERS, timeout=18)
     response.raise_for_status()
 
     apparent_encoding = response.apparent_encoding or ""
@@ -175,32 +187,34 @@ def infer_sector(name: str) -> str:
     if "스팩" in name or "기업인수목적" in name:
         return "SPAC"
 
-    if any(keyword in name for keyword in ["바이오", "헬스", "제약", "메디", "셀", "로직스"]):
+    if any(keyword in name for keyword in ["바이오", "헬스", "제약", "메디", "셀", "로직스", "이뮨"]):
         return "바이오 / 헬스케어"
 
     if any(keyword in name for keyword in ["로보", "비젼", "비전", "AI", "에이아이", "테크", "소프트", "락스"]):
         return "AI / 로봇 / 소프트웨어"
 
-    if any(keyword in name for keyword in ["에너지", "배터리", "전지", "소재", "그린"]):
+    if any(keyword in name for keyword in ["에너지", "배터리", "전지", "소재", "그린", "SKC"]):
         return "에너지 / 소재"
 
     if any(keyword in name for keyword in ["스튜디오", "콘텐츠", "엔터"]):
         return "콘텐츠 / 엔터테인먼트"
 
-    if any(keyword in name for keyword in ["푸드", "식품"]):
+    if any(keyword in name for keyword in ["푸드", "식품", "피스피스"]):
         return "식품 / 소비재"
 
     return "확인 필요"
 
 
-def infer_market(name: str, row_text: str) -> str:
-    if "스팩" in name or "기업인수목적" in name:
+def infer_market(name: str, row_text: str = "") -> str:
+    text = f"{name} {row_text}"
+
+    if "스팩" in text or "기업인수목적" in text:
         return "SPAC"
 
-    if "코스피" in row_text or "유가증권" in row_text:
+    if "유가증권" in text or "코스피" in text:
         return "KOSPI"
 
-    if "코스닥" in row_text:
+    if "코스닥" in text or re.search(r"(^|\s)코\s", text):
         return "KOSDAQ"
 
     return "확인 필요"
@@ -255,14 +269,15 @@ def make_analysis(item: IPOItem) -> IPOItem:
 
     if not item.overview:
         item.overview = (
-            f"{item.name}은/는 공개 공모주 일정에 등록된 종목입니다. "
-            f"현재 자동 분류 업종은 '{item.sector}'이며, 정확한 사업 내용은 증권신고서와 주관사 투자설명서를 통해 추가 확인하는 것이 좋습니다."
+            f"{item.name}은/는 공개 공모주 일정에서 수집된 종목입니다. "
+            f"현재 자동 분류 업종은 '{item.sector}'입니다. "
+            f"정확한 사업 내용은 DART 증권신고서와 주관사 투자설명서를 함께 확인하는 것이 좋습니다."
         )
 
     if not item.outlook:
         if "SPAC" in item.sector:
             item.outlook = (
-                "스팩 종목은 합병 대상 기업이 확정되기 전까지 일반 사업회사와 평가 방식이 다릅니다. "
+                "스팩 종목은 합병 대상 기업이 확정되기 전까지 일반 사업회사와 평가 방식이 다르며, "
                 "합병 대상의 질과 합병 성공 가능성이 핵심입니다."
             )
         elif item.score >= 70:
@@ -291,7 +306,104 @@ def make_analysis(item: IPOItem) -> IPOItem:
     return item
 
 
-def parse_38_table(html: str, source: Dict[str, str], default_year: int) -> List[IPOItem]:
+def parse_dart_calendar(html: str, source: Dict[str, str], default_year: int) -> List[IPOItem]:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+    lines = [normalize_space(line) for line in text.splitlines() if normalize_space(line)]
+    joined = " ".join(lines)
+
+    year_match = re.search(r"(20\d{2})\s*년", joined)
+    month_match = re.search(r"(?:^|\s)(\d{1,2})\s*월", joined)
+
+    year = int(year_match.group(1)) if year_match else default_year
+    month = int(month_match.group(1)) if month_match else datetime.now().month
+
+    events: Dict[str, Dict[str, Any]] = {}
+    current_day: Optional[int] = None
+
+    market_map = {
+        "코": "KOSDAQ",
+        "유": "KOSPI",
+        "기": "기타",
+    }
+
+    for line in lines:
+        if re.fullmatch(r"\d{1,2}", line):
+            day = int(line)
+
+            if 1 <= day <= 31:
+                current_day = day
+
+            continue
+
+        inline_date = normalize_date_range(line, year)
+
+        if inline_date:
+            current_day = int(inline_date[0][-2:])
+            month = int(inline_date[0][5:7])
+
+        if current_day is None:
+            continue
+
+        for match in re.finditer(r"([코유기])\s*([^\[\]\n\r]+?)\s*\[(시작|종료)\]", line):
+            market_code = match.group(1).strip()
+            name = normalize_space(match.group(2))
+            event_type = match.group(3).strip()
+
+            if not name:
+                continue
+
+            date_value = f"{year:04d}-{month:02d}-{current_day:02d}"
+
+            if name not in events:
+                market = market_map.get(market_code, "확인 필요")
+
+                if "스팩" in name or "기업인수목적" in name:
+                    market = "SPAC"
+
+                events[name] = {
+                    "name": name,
+                    "market": market,
+                    "start": "",
+                    "end": "",
+                }
+
+            if event_type == "시작":
+                events[name]["start"] = date_value
+            elif event_type == "종료":
+                events[name]["end"] = date_value
+
+    items: List[IPOItem] = []
+
+    for name, info in events.items():
+        start_date = info.get("start") or info.get("end")
+        end_date = info.get("end") or info.get("start")
+
+        if not start_date:
+            continue
+
+        item = IPOItem(
+            id=f"{name}-{start_date}".replace(" ", "-"),
+            name=name,
+            market=info.get("market", "확인 필요"),
+            sector=infer_sector(name),
+            subscriptionStart=start_date,
+            subscriptionEnd=end_date,
+            manager="DART 확인 필요",
+            priceBand="DART/주관사 확인 필요",
+            finalPrice="미정",
+            competitionRate="예정",
+            source=source["name"],
+            sourceUrl=source["url"],
+            detailUrl=source["url"],
+        )
+
+        items.append(make_analysis(item))
+
+    return sorted(items, key=lambda item: (item.subscriptionStart, item.name))
+
+
+def parse_generic_table(html: str, source: Dict[str, str], default_year: int) -> List[IPOItem]:
     soup = BeautifulSoup(html, "html.parser")
     items: List[IPOItem] = []
 
@@ -402,34 +514,6 @@ def dedupe_items(items: List[IPOItem]) -> List[IPOItem]:
     return sorted(result.values(), key=lambda item: (item.subscriptionStart, item.name))
 
 
-def fallback_items(year: int) -> List[IPOItem]:
-    return [
-        IPOItem(
-            id=f"fallback-{year}",
-            name="자동수집 대기",
-            market="확인 필요",
-            sector="확인 필요",
-            subscriptionStart=f"{year}-01-01",
-            subscriptionEnd=f"{year}-01-01",
-            manager="확인 필요",
-            priceBand="확인 필요",
-            finalPrice="미정",
-            competitionRate="예정",
-            overview="외부 공모주 페이지 수집이 일시적으로 실패했습니다. 인터넷에서 새로고침을 다시 눌러 주세요.",
-            outlook="Render 무료 서버 첫 실행, 외부 사이트 응답 지연, 또는 사이트 구조 변경일 수 있습니다.",
-            risks=[
-                "외부 사이트 구조 변경 가능성",
-                "일시적인 네트워크 오류 가능성",
-                "청약 전 DART/KRX/주관사 공지 재확인 필요",
-            ],
-            score=50,
-            source="fallback",
-            sourceUrl="",
-            detailUrl="",
-        )
-    ]
-
-
 def collect_ipos(force: bool = False, year: Optional[int] = None) -> Dict[str, Any]:
     year = year or datetime.now().year
 
@@ -444,19 +528,24 @@ def collect_ipos(force: bool = False, year: Optional[int] = None) -> Dict[str, A
 
     all_items: List[IPOItem] = []
     errors: List[str] = []
+    source_counts: Dict[str, int] = {}
 
     for source in SOURCES:
         try:
             html = fetch_html(source["url"])
-            parsed = parse_38_table(html, source, year)
+
+            if source["type"] == "dart_calendar":
+                parsed = parse_dart_calendar(html, source, year)
+            else:
+                parsed = parse_generic_table(html, source, year)
+
+            source_counts[source["name"]] = len(parsed)
             all_items.extend(parsed)
+
         except Exception as exc:
             errors.append(f"{source['name']}: {exc}")
 
     items = dedupe_items(all_items)
-
-    if not items:
-        items = fallback_items(year)
 
     payload = {
         "ok": True,
@@ -465,8 +554,9 @@ def collect_ipos(force: bool = False, year: Optional[int] = None) -> Dict[str, A
         "count": len(items),
         "items": [item.to_dict() for item in items],
         "errors": errors,
+        "sourceCounts": source_counts,
         "sources": SOURCES,
-        "note": "API 인증키 없이 공개 페이지를 읽어온 결과입니다. 외부 사이트 구조 변경 시 일부 누락될 수 있습니다.",
+        "note": "API 인증키 없이 공개 웹페이지를 읽어온 결과입니다. 외부 사이트 구조 변경 또는 접속 차단 시 일부 누락될 수 있습니다.",
     }
 
     CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -479,7 +569,6 @@ HTML_PAGE = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#020617" />
   <title>공모주 인사이트 자동수집</title>
   <style>
     :root {
@@ -627,6 +716,18 @@ HTML_PAGE = r"""<!doctype html>
       line-height: 1.65;
       font-size: 14px;
       font-weight: 800;
+    }
+
+    .source-status {
+      margin-top: 12px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+      color: var(--muted);
+      line-height: 1.7;
+      font-size: 13px;
+      white-space: pre-wrap;
     }
 
     .top-actions {
@@ -1141,9 +1242,9 @@ HTML_PAGE = r"""<!doctype html>
     <section class="hero">
       <div class="hero-grid">
         <div>
-          <div class="badge">✓ Auto Fetch · Monthly IPO Calendar · Demand Heat</div>
-          <h1>공모주 청약일정을 자동으로 읽어오는 분석 웹</h1>
-          <p>서버가 공개 공모주 페이지를 읽어오고, 웹은 월별 청약 일정·회사개요·전망·흥행 판단·카카오톡 공유 문구를 자동으로 구성합니다.</p>
+          <div class="badge">✓ DART · KRX KIND · Public Sources</div>
+          <h1>공모주 청약일정을 공개 웹페이지에서 자동 수집하는 웹</h1>
+          <p>DART 청약달력, KRX KIND, 기타 공개 공모주 페이지를 순서대로 읽어 월별 일정·회사개요·전망·흥행 판단·카카오톡 공유 문구를 구성합니다.</p>
         </div>
         <div class="statbox">
           <div class="stat"><span>선택월 공모주</span><strong id="statMonthCount">0개</strong></div>
@@ -1154,17 +1255,17 @@ HTML_PAGE = r"""<!doctype html>
     </section>
 
     <section class="source-panel">
-      <h2>자동 수집 방식</h2>
+      <h2>자동 수집 상태</h2>
       <div class="notice">
-        이 웹은 손으로 종목을 추가하는 구조가 아니라, 서버가 공개 공모주 페이지를 읽어와 자동 표시합니다.
-        외부 사이트 HTML 구조가 바뀌면 일부 항목이 누락될 수 있어, 청약 전에는 원본 페이지와 DART/KRX도 함께 확인하는 것이 좋습니다.
+        API 키 없이 공개 웹페이지를 읽는 방식입니다. 특정 사이트가 SSL 오류나 timeout으로 막혀도 DART/KRX 등 다른 소스를 순서대로 시도합니다.
       </div>
       <div class="top-actions">
         <button class="btn primary" onclick="loadData(true)">인터넷에서 새로고침</button>
         <button class="btn blue" onclick="loadData(false)">캐시 불러오기</button>
-        <a class="btn" href="https://www.38.co.kr/html/fund/?o=k" target="_blank">38 원본 확인 ↗</a>
-        <a class="btn" href="https://kind.krx.co.kr/listinvstg/pubofrschdl.do?method=searchPubofrScholMain" target="_blank">KRX KIND 확인 ↗</a>
+        <a class="btn" href="https://dart.fss.or.kr/dsac008/main.do" target="_blank">DART 청약달력 ↗</a>
+        <a class="btn" href="https://kind.krx.co.kr/listinvstg/pubofrschdl.do?method=searchPubofrScholMain" target="_blank">KRX KIND ↗</a>
       </div>
+      <div id="sourceStatus" class="source-status">수집 상태 확인 중...</div>
     </section>
 
     <section class="month-area">
@@ -1270,6 +1371,7 @@ HTML_PAGE = r"""<!doctype html>
 
     async function loadData(force = false) {
       $("list").innerHTML = `<div class="ipo-card">인터넷 공모주 데이터를 불러오는 중...</div>`;
+      $("sourceStatus").textContent = "수집 중...";
 
       try {
         const response = await fetch(`/api/ipos?year=${YEAR}&force=${force ? 1 : 0}`);
@@ -1277,6 +1379,21 @@ HTML_PAGE = r"""<!doctype html>
 
         ipos = data.items || [];
         $("statUpdated").textContent = data.cachedAtText ? data.cachedAtText.slice(5, 16) : "-";
+
+        const statusLines = [];
+        statusLines.push(`전체 수집 종목: ${data.count || 0}개`);
+        statusLines.push(`소스별 수집: ${JSON.stringify(data.sourceCounts || {}, null, 2)}`);
+
+        if (data.errors && data.errors.length) {
+          statusLines.push("수집 실패/경고:");
+          data.errors.forEach(error => statusLines.push("- " + error));
+        }
+
+        if (data.note) {
+          statusLines.push(data.note);
+        }
+
+        $("sourceStatus").textContent = statusLines.join("\n");
 
         const currentMonthFirst = monthItems()[0];
 
@@ -1288,11 +1405,8 @@ HTML_PAGE = r"""<!doctype html>
         }
 
         renderAll();
-
-        if (data.errors && data.errors.length) {
-          console.warn("수집 경고:", data.errors);
-        }
       } catch (error) {
+        $("sourceStatus").textContent = "수집 실패: " + error.message;
         $("list").innerHTML = `
           <div class="ipo-card">
             <h3>수집 실패</h3>
@@ -1360,7 +1474,7 @@ HTML_PAGE = r"""<!doctype html>
               </article>
             `;
           }).join("")
-        : `<div class="loading">수집된 일정이 없습니다.</div>`;
+        : `<div class="loading">수집된 일정이 없습니다. 위의 자동 수집 상태에서 실패 원인을 확인하세요.</div>`;
     }
 
     function renderStats() {
@@ -1407,7 +1521,7 @@ HTML_PAGE = r"""<!doctype html>
       const item = currentIpo();
 
       if (!item) {
-        $("detail").innerHTML = `<div class="eyebrow">NO DATA</div><h2>데이터 없음</h2>`;
+        $("detail").innerHTML = `<div class="eyebrow">NO DATA</div><h2>데이터 없음</h2><p class="detail-sub">위의 자동 수집 상태를 확인하세요.</p>`;
 
         return;
       }
@@ -1444,7 +1558,7 @@ HTML_PAGE = r"""<!doctype html>
 
         <div class="buttons">
           ${item.detailUrl ? `<a class="btn primary" href="${escapeHtml(item.detailUrl)}" target="_blank">원본 상세 ↗</a>` : ""}
-          <a class="btn" href="${escapeHtml(item.sourceUrl || "https://www.38.co.kr/html/fund/?o=k")}" target="_blank">출처 페이지 ↗</a>
+          <a class="btn" href="${escapeHtml(item.sourceUrl || "https://dart.fss.or.kr/dsac008/main.do")}" target="_blank">출처 페이지 ↗</a>
           <button class="btn kakao" onclick="copyShareText()">카카오톡 문구 복사</button>
         </div>
       `;
@@ -1563,9 +1677,9 @@ def health():
         {
             "ok": True,
             "time": datetime.now().isoformat(),
-            "appDir": str(APP_DIR),
-            "mode": "single-file-server",
-            "message": "server.py 자체에서 첫 화면 HTML을 제공합니다.",
+            "mode": "public-page-scraper-single-file",
+            "sources": SOURCES,
+            "message": "DART/KRX API 키 없이 공개 웹페이지를 순서대로 읽습니다.",
         }
     )
 
@@ -1576,6 +1690,6 @@ def not_found(_error):
 
 
 if __name__ == "__main__":
-    print("공모주 인사이트 자동수집 웹 - Render FIX FULL VERSION")
+    print("공모주 인사이트 자동수집 웹 - PUBLIC SOURCES FINAL")
     print("브라우저에서 http://127.0.0.1:5077 로 접속하세요.")
     app.run(host="127.0.0.1", port=5077, debug=True)
