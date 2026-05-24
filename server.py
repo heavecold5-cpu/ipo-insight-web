@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-공모주 인사이트 모바일 최종본
+공모주 인사이트 모바일 최종본 MAYFIX
 
-목표:
+핵심 수정:
 - 모바일 전용 카드형 공모주 일정 웹
 - DART/KRX API 키 없이 공개 웹페이지 우선 수집
 - DART 청약달력 → KRX KIND → 38커뮤니케이션 → IPO38 순서로 시도
 - 한 소스가 실패해도 서버가 죽지 않도록 처리
 - Render 502 방지를 위해 외부 요청 timeout을 짧게 설정
 - public/Profile 폴더 없이 server.py 단일 파일로 첫 화면 제공
+- DART 페이지의 월 선택 목록 때문에 1월로 잘못 잡히던 문제 수정
+  → 기본 월은 서버 현재 월을 사용하고, 실제 이벤트 줄에 명시 날짜가 있을 때만 월을 갱신
 
 Render Start Command:
 gunicorn server:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
@@ -307,16 +309,27 @@ def make_analysis(item: IPOItem) -> IPOItem:
 
 
 def parse_dart_calendar(html: str, source: Dict[str, Any], default_year: int) -> List[IPOItem]:
+    """
+    DART 청약달력 페이지의 텍스트에서
+    '코 폴레드 [시작]', '코 폴레드 [종료]' 같은 패턴을 읽는다.
+
+    중요:
+    DART HTML 안에는 1월~12월 선택 메뉴가 같이 들어 있기 때문에
+    텍스트에서 처음 발견되는 '1월'을 현재 월로 쓰면 안 된다.
+    그래서 기본 월은 서버 현재 월을 사용한다.
+    """
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
     lines = [normalize_space(line) for line in text.splitlines() if normalize_space(line)]
     joined = " ".join(lines)
 
     year_match = re.search(r"(20\d{2})\s*년", joined)
-    month_match = re.search(r"(?:^|\s)(\d{1,2})\s*월", joined)
-
     year = int(year_match.group(1)) if year_match else default_year
-    month = int(month_match.group(1)) if month_match else datetime.now().month
+
+    # 핵심 수정:
+    # DART 페이지 안의 월 선택 목록 때문에 1월이 잘못 잡히는 문제 방지
+    # 기본 월은 서버 현재 월을 사용한다.
+    month = datetime.now().month
 
     events: Dict[str, Dict[str, Any]] = {}
     current_day: Optional[int] = None
@@ -328,6 +341,7 @@ def parse_dart_calendar(html: str, source: Dict[str, Any], default_year: int) ->
     }
 
     for line in lines:
+        # 날짜만 있는 줄 처리: 04, 05, 06 등
         if re.fullmatch(r"\d{1,2}", line):
             day = int(line)
 
@@ -336,6 +350,7 @@ def parse_dart_calendar(html: str, source: Dict[str, Any], default_year: int) ->
 
             continue
 
+        # 한 줄에 05.04 같은 날짜가 들어 있는 경우 보조 처리
         inline_date = normalize_date_range(line, year)
 
         if inline_date:
@@ -345,6 +360,7 @@ def parse_dart_calendar(html: str, source: Dict[str, Any], default_year: int) ->
         if current_day is None:
             continue
 
+        # 예: 코 폴레드 [시작], 코 폴레드 [종료]
         for match in re.finditer(r"([코유기])\s*([^\[\]\n\r]+?)\s*\[(시작|종료)\]", line):
             market_code = match.group(1).strip()
             name = normalize_space(match.group(2))
@@ -1472,9 +1488,9 @@ def health():
         {
             "ok": True,
             "time": datetime.now().isoformat(),
-            "mode": "mobile-final-single-file",
+            "mode": "mobile-final-mayfix-single-file",
             "sources": SOURCES,
-            "message": "모바일 전용 UI와 공개 웹페이지 자동수집을 사용합니다.",
+            "message": "모바일 전용 UI, 공개 웹페이지 자동수집, DART 월 파싱 수정 버전입니다.",
         }
     )
 
@@ -1485,6 +1501,6 @@ def not_found(_error):
 
 
 if __name__ == "__main__":
-    print("공모주 인사이트 모바일 최종본")
+    print("공모주 인사이트 모바일 최종본 MAYFIX")
     print("브라우저에서 http://127.0.0.1:5077 로 접속하세요.")
     app.run(host="127.0.0.1", port=5077, debug=True)
