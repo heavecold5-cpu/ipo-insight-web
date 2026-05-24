@@ -29,7 +29,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify, send_from_directory, request
 
 APP_DIR = Path(__file__).resolve().parent
-PUBLIC_DIR = APP_DIR / "public"
+PUBLIC_DIR = APP_DIR /  "Profile"
 DATA_DIR = APP_DIR / "data"
 CACHE_FILE = DATA_DIR / "ipo_cache.json"
 
