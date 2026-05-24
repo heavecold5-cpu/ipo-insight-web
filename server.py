@@ -361,7 +361,7 @@ def parse_dart_calendar(html: str, source: Dict[str, Any], default_year: int) ->
             continue
 
         # 예: 코 폴레드 [시작], 코 폴레드 [종료]
-        for match in re.finditer(r"([코유기])\s*([^\[\]\n\r]+?)\s*\[(시작|종료)\]", line):
+        for match in re.finditer(r"(?:^|\s)([코유기])\s+([^\[\]\n\r]+?)\s*\[(시작|종료)\]", line):          
             market_code = match.group(1).strip()
             name = normalize_space(match.group(2))
             event_type = match.group(3).strip()
